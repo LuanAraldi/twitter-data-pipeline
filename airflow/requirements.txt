@@ -1,0 +1,6 @@
+twarc
+numpy
+pandas
+pyarrow
+boto3
+flatdict
