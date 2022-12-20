@@ -7,6 +7,7 @@ from airflow.decorators import task
 from airflow.models import Variable
 from datetime import datetime
 import logging
+import pandas as pd
 
 with DAG(
     dag_id="twitter_pipeline",
@@ -18,17 +19,73 @@ with DAG(
 
     now = pendulum.now("Europe/Berlin")
 
+    @task()
+    def process_twitter_data(date_end: datetime = now, date_start: datetime = now.subtract(days=7)):
+        import glob
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        if date_start > date_end:
+            logging.ERROR("End date bigger than start date, not able to process data")
+
+        parquet_partition_file_path = glob.glob('/tmp/data/raw/**/**/*')
+        
+        date_to_find = date_start
+
+        partitions_to_read_parquet_files_from = []
+        while date_to_find < date_end:
+            partition_file_string = f"/tmp/data/raw/year={date_to_find.year}/month={date_to_find.month}/day={date_to_find.day}"
+            if partition_file_string in parquet_partition_file_path:
+                partitions_to_read_parquet_files_from.append(partition_file_string)
+            date_to_find = date_to_find.add(days=1)
+
+        print(partitions_to_read_parquet_files_from)
+        
+        df = pd.concat(
+            pd.read_parquet(parquet_file) for parquet_file in partitions_to_read_parquet_files_from
+        )
+        
+        def check_if_is_retweet(row):
+            if row is None:
+                return False
+            for referenced_tweet in row:
+                if referenced_tweet["type"] == "retweeted":
+                    return True
+            return False
+
+        df2 = pd.DataFrame().assign(
+            text=df["text"],
+            user_id=df["author_id"], 
+            location=df["author.location"], 
+            number_of_followers=df["author.public_metrics.followers_count"],
+            created_at=df["created_at"],
+            hashtags=df["entities.hashtags"],
+            retweet_count=df["public_metrics.retweet_count"],
+            is_retweet=df["referenced_tweets"],
+            partition_date=df["created_at"].dt.to_period('D'))
+
+        df2["is_retweet"] = df2.apply(lambda row: check_if_is_retweet(row["is_retweet"]), axis=1)
+
+        table = pa.Table.from_pandas(df2)
+
+        logging.info("Writing tweets to parquet file")
+        pq.write_to_dataset(
+            table,
+            root_path='/tmp/data/processed',
+            partition_cols=['partition_date']
+        )
+
+
+
 
     @task()
     def get_twitter_data_by_mention_and_date_range(mentions: str = "flixbus", date_end: datetime = now, date_start: datetime = now.subtract(days=7)):
-        
         from twarc import Twarc2, expansions
         from flatdict import FlatDict
-        import pandas as pd
         import pyarrow as pa
         import pyarrow.parquet as pq
         
-
+        return 0
         client = Twarc2(bearer_token=Variable.get('twitter_bearer_token'))
         # End time shenanigans for twitter api without privileged access, end time needs to be 10s before the request time
         end_time = date_end.subtract(seconds=10)
@@ -36,8 +93,8 @@ with DAG(
         start_time = date_start.add(minutes=5)
         
         expansion_fields = "referenced_tweets.id,author_id"
-        tweet_fields = "created_at"
-        user_fields = "location"
+        tweet_fields = "created_at,public_metrics,entities"
+        user_fields = "location,public_metrics"
         media_fields = "public_metrics"
         query = mentions
 
@@ -81,6 +138,4 @@ with DAG(
             )
 
 
-    
-
-    get_twitter_data_by_mention_and_date_range("flixbus")
+    get_twitter_data_by_mention_and_date_range() >> process_twitter_data()
