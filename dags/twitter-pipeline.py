@@ -5,7 +5,7 @@ import json
 from airflow import DAG
 from airflow.decorators import task
 from airflow.models import Variable
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import pandas as pd
 
@@ -15,11 +15,12 @@ with DAG(
     start_date=pendulum.datetime(2022, 12, 1, tz="UTC"),
     catchup=False,
     tags=["twitter"],
+    default_args={"retries": 5}
 ) as dag:
 
     now = pendulum.now("Europe/Berlin")
 
-    @task()
+    @task(retries=3, retry_delay=timedelta(seconds=20))
     def process_twitter_data(date_end: datetime = now, date_start: datetime = now.subtract(days=7)):
         import glob
         import pyarrow as pa
@@ -39,11 +40,10 @@ with DAG(
                 partitions_to_read_parquet_files_from.append(partition_file_string)
             date_to_find = date_to_find.add(days=1)
 
-        print(partitions_to_read_parquet_files_from)
         
         df = pd.concat(
             pd.read_parquet(parquet_file) for parquet_file in partitions_to_read_parquet_files_from
-        )
+        ).drop_duplicates(subset=["text", "author_id", "created_at"])
         
         def check_if_is_retweet(row):
             if row is None:
@@ -62,7 +62,7 @@ with DAG(
             hashtags=df["entities.hashtags"],
             retweet_count=df["public_metrics.retweet_count"],
             is_retweet=df["referenced_tweets"],
-            partition_date=df["created_at"].dt.to_period('D'))
+            partition_date=df["created_at"].dt.to_period('D').astype(str))
 
         df2["is_retweet"] = df2.apply(lambda row: check_if_is_retweet(row["is_retweet"]), axis=1)
 
@@ -78,20 +78,19 @@ with DAG(
 
 
 
-    @task()
+    @task(retries=3, retry_delay=timedelta(seconds=20))
     def get_twitter_data_by_mention_and_date_range(mentions: str = "flixbus", date_end: datetime = now, date_start: datetime = now.subtract(days=7)):
         from twarc import Twarc2, expansions
         from flatdict import FlatDict
         import pyarrow as pa
         import pyarrow.parquet as pq
-        
-        return 0
+        logging.info("Starting to fetch data from Twitter API")
         client = Twarc2(bearer_token=Variable.get('twitter_bearer_token'))
         # End time shenanigans for twitter api without privileged access, end time needs to be 10s before the request time
         end_time = date_end.subtract(seconds=10)
         # Workaroud to get around the non privileged access of getting a 401 after a couple of requests because the start time was bigger than 7 days
         start_time = date_start.add(minutes=5)
-        
+
         expansion_fields = "referenced_tweets.id,author_id"
         tweet_fields = "created_at,public_metrics,entities"
         user_fields = "location,public_metrics"
