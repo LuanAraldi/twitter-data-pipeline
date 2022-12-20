@@ -2,26 +2,42 @@ import pendulum
 import json
 
 from airflow import DAG
-from airflow.decorators import task
+from airflow.decorators import task, dag
+from airflow.models.param import Param
 from airflow.models import Variable
+from airflow.operators.python import get_current_context
 from datetime import datetime, timedelta
 import logging
 
 now = pendulum.now("Europe/Berlin")
 
-with DAG(
-    dag_id="twitter_pipeline",
+# Airflow DAG
+# It accepts 5 params
+#
+# mentions: str = "flixbus"
+#   string query to use on the Twitter API
+#
+# extract_date_start: int = now - 7 days
+#   timestamp format for the date_start to query data to the twitter API
+#
+# extract_date_end: int = now
+#   timestamp format for the date_end to query data to the twitter API
+#
+# process_date_start: int = now - 7 days
+#   timestamp format to use for the processing on the extracted data
+#
+# process_date_end: int = now
+#   timestamp format to use for the processing on the extracted data
+#
+@dag(
+    dag_id="twitter_pipeline_etl",
     schedule=None,
     start_date=pendulum.datetime(2022, 12, 1, tz="UTC"),
     catchup=False,
     tags=["twitter"],
-    default_args={"retries": 5},
-    params={
-        "date_start": now.subtract(days=7),
-        "date_end": now,
-        "tweet_query": "flixbus",
-    },
-) as dag:
+    default_args={"retries": 5}
+)
+def etl_twitter_data():
 
     @task(retries=3, retry_delay=timedelta(seconds=20))
     def process_twitter_data(
@@ -31,6 +47,14 @@ with DAG(
         import pyarrow as pa
         import pyarrow.parquet as pq
         import pandas as pd
+
+        context = get_current_context()
+
+        if context.get("params", {}).get("process_date_start", None):
+            date_start = pendulum.from_timestamp(context.get("params", {}).get("process_date_start"))
+
+        if context.get("params", {}).get("process_date_end", None):
+            date_end = pendulum.from_timestamp(context.get("params", {}).get("process_date_end"))
 
         if date_start > date_end:
             logging.ERROR("End date bigger than start date, not able to process data")
@@ -94,7 +118,20 @@ with DAG(
         import pyarrow.parquet as pq
         import pandas as pd
 
+        context = get_current_context()
+        
+        if context.get("params", {}).get("mentions", None):
+            mentions = context.get("params", {}).get("mentions")
+        
+        if context.get("params", {}).get("extract_date_start", None):
+            date_start = pendulum.from_timestamp(context.get("params", {}).get("extract_date_start"))
+
+        if context.get("params", {}).get("extract_date_end", None):
+            date_end = pendulum.from_timestamp(context.get("params", {}).get("extract_date_end"))
+
+        logging.info(f"Params are {mentions} and {date_start} and {date_end}")
         logging.info("Starting to fetch data from Twitter API")
+
         client = Twarc2(bearer_token=Variable.get("twitter_bearer_token"))
         # End time shenanigans for twitter api without privileged access, end time needs to be 10s before the request time
         end_time = date_end.subtract(seconds=10)
@@ -151,10 +188,8 @@ with DAG(
                 partition_cols=["year", "month", "day"],
             )
 
-    get_twitter_data_by_mention_and_date_range(
-        mentions="{{params.tweet_query}}",
-        date_end="{{params.date_end}}",
-        date_start="{{params.date_start}}",
-    ) >> process_twitter_data(
-        date_end="{{params.date_end}}", date_start="{{params.date_start}}"
-    )
+    twitter_extract = get_twitter_data_by_mention_and_date_range()
+    process = process_twitter_data()
+
+    twitter_extract >> process
+etl_twitter_data()
